@@ -50,6 +50,58 @@
 (defn ^:export recall [node]
   (.get ^js memories node))
 
+;; Replicant addresses a node by its position among the children of its parent.
+;; Other code inserts nodes of its own into the document: password managers put
+;; an element next to an input field, for example. Such a node shifts the
+;; position of every sibling after it, and updates land on the wrong nodes.
+;;
+;; To be independent of foreign nodes, positions are counted among the nodes
+;; Replicant created. Every created node is marked, and every parent keeps the
+;; number of marked children it holds. While that number equals the number of
+;; child nodes there are no foreign nodes, and the position is the index.
+
+(defn ^:no-doc own-child-count [^js el]
+  (or (.-replicantChildCount el) 0))
+
+(defn ^:no-doc mark-own [^js node]
+  (set! (.-replicantNode node) true)
+  node)
+
+(defn ^:no-doc track-insert
+  "Call before inserting `child` in `el`. Moving a node within its parent does
+  not change the number of children."
+  [^js el ^js child]
+  (when (.-replicantNode child)
+    (let [parent (.-parentNode child)]
+      (when-not (identical? el parent)
+        (when (and parent (< 0 (own-child-count parent)))
+          (set! (.-replicantChildCount parent) (dec (own-child-count parent))))
+        (set! (.-replicantChildCount el) (inc (own-child-count el)))))))
+
+(defn ^:no-doc track-remove
+  "Call before removing `child` from `el`."
+  [^js el ^js child]
+  (when (and (.-replicantNode child)
+             (identical? el (.-parentNode child))
+             (< 0 (own-child-count el)))
+    (set! (.-replicantChildCount el) (dec (own-child-count el)))))
+
+(defn ^:no-doc get-own-child
+  "Returns the child of `el` at position `idx`, not counting nodes that were not
+  created by Replicant."
+  [^js el idx]
+  (let [children (.-childNodes el)]
+    (if (== (.-length children) (own-child-count el))
+      (aget children idx)
+      (loop [node (.-firstChild el)
+             n idx]
+        (when node
+          (if (.-replicantNode node)
+            (if (== 0 n)
+              node
+              (recur (.-nextSibling node) (dec n)))
+            (recur (.-nextSibling node) n)))))))
+
 (defn ^:no-doc create-renderer []
   (reify
     replicant/IRender
@@ -57,12 +109,13 @@
       (.-isConnected el))
 
     (create-text-node [_this text]
-      (js/document.createTextNode text))
+      (mark-own (js/document.createTextNode text)))
 
     (create-element [_this tag-name options]
-      (if-let [ns (:ns options)]
-        (js/document.createElementNS ns tag-name)
-        (js/document.createElement tag-name)))
+      (mark-own
+       (if-let [ns (:ns options)]
+         (js/document.createElementNS ns tag-name)
+         (js/document.createElement tag-name))))
 
     (set-style [this ^js el style v]
       (.setProperty (.-style el) (name style) v)
@@ -84,7 +137,9 @@
       (errors/with-error-handling "setting attribute" {:el el :attr attr :v v}
         (cond
           (= "innerHTML" attr)
-          (set! (.-innerHTML el) v)
+          (do
+            (set! (.-innerHTML el) v)
+            (set! (.-replicantChildCount el) 0))
 
           (= "value" attr)
           (set! (.-value el) v)
@@ -114,7 +169,9 @@
     (remove-attribute [this ^js el attr]
       (cond
         (= "innerHTML" attr)
-        (set! (.-innerHTML el) "")
+        (do
+          (set! (.-innerHTML el) "")
+          (set! (.-replicantChildCount el) 0))
 
         (= "value" attr)
         (set! (.-value el) nil)
@@ -154,14 +211,17 @@
       this)
 
     (append-child [this ^js el child-node]
+      (track-insert el child-node)
       (.appendChild el child-node)
       this)
 
     (insert-before [this ^js el child-node reference-node]
+      (track-insert el child-node)
       (.insertBefore el child-node reference-node)
       this)
 
     (remove-child [this ^js el child-node]
+      (track-remove el child-node)
       (.removeChild el child-node)
       this)
 
@@ -170,15 +230,18 @@
       this)
 
     (replace-child [this ^js el insert-child replace-child]
+      (track-remove el replace-child)
+      (track-insert el insert-child)
       (.replaceChild el insert-child replace-child)
       this)
 
     (remove-all-children [this ^js el]
       (set! (.-textContent el) "")
+      (set! (.-replicantChildCount el) 0)
       this)
 
     (get-child [_this ^js el idx]
-      (aget (.-childNodes el) idx))
+      (get-own-child el idx))
 
     (next-frame [_this f]
       (on-next-frame f))
@@ -201,6 +264,7 @@
   (let [rendering? (get-in @state [el :rendering?])]
     (when-not (contains? @state el)
       (set! (.-innerHTML el) "")
+      (set! (.-replicantChildCount el) 0)
       (vswap! state assoc el {:renderer (create-renderer)
                               :unmounts (volatile! #{})
                               :unmount-hooks (volatile! (r/node-map))
